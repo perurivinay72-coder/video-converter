@@ -94,9 +94,12 @@ YOUTUBE_FILENAME = "youtube_links.txt"
 
 def convert_file(filepath: Path, output_dir: Path) -> bool:
     """Convert a single file to Markdown. Returns True on success."""
-    md = MarkItDown()
     out_path = output_dir / (filepath.stem + ".md")
+    if out_path.exists():
+        log.info(f"Skipping: {filepath.name} (already converted, output file exists)")
+        return True
 
+    md = MarkItDown()
     try:
         log.info(f"Converting: {filepath.name}")
         result = md.convert(str(filepath))
@@ -207,6 +210,9 @@ def transcribe_long_audio(file_path: Path) -> str:
 def convert_audio_file(filepath: Path, output_dir: Path):
     """Convert an audio/video file to Markdown by chunked transcription."""
     out_path = output_dir / (filepath.stem + ".md")
+    if out_path.exists():
+        log.info(f"Skipping: {filepath.name} (already converted, output file exists)")
+        return True
 
     try:
         log.info(f"Converting: {filepath.name}")
@@ -246,16 +252,20 @@ def convert_youtube_links(filepath: Path, output_dir: Path):
 
     for url in urls:
         try:
+            # Use video ID or sanitized URL as filename
+            video_id = url.split("v=")[-1].split("&")[0] if "v=" in url else url[-11:]
+            out_path = output_dir / f"youtube_{video_id}.md"
+
+            if out_path.exists():
+                log.info(f"Skipping YouTube URL: {url} (already converted, output file exists)")
+                continue
+
             log.info(f"Transcribing: {url}")
             result = md.convert(url)
 
             if not result.text_content or result.text_content.strip() == "":
                 log.warning(f"Empty transcript for {url}")
                 continue
-
-            # Use video ID or sanitized URL as filename
-            video_id = url.split("v=")[-1].split("&")[0] if "v=" in url else url[-11:]
-            out_path = output_dir / f"youtube_{video_id}.md"
 
             header = (
                 f"# YouTube Transcript\n\n"
