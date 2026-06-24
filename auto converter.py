@@ -6,13 +6,14 @@ Output saved to /outputs folder with the same filename + .md extension.
 
 Supported:
   - PDF, DOCX, PPTX, XLSX, XLS
-  - MP3, WAV, M4A, FLAC (audio transcription via Google Speech)
+  - MP3, WAV, M4A, FLAC, OGG, MP4, MKV, AVI, MOV, WEBM (via OpenAI Whisper - full content)
   - HTML, TXT, CSV, JSON
   - youtube_links.txt (one YouTube URL per line)
 
 Usage:
-  python auto_converter.py
-  python auto_converter.py --input ./my-folder --output ./my-output
+  python "auto converter.py"
+  python "auto converter.py" --input ./my-folder --output ./my-output
+  python "auto converter.py" --once   (process existing + exit)
 
 Author: Built for Vinay's RAG pipeline
 """
@@ -21,13 +22,15 @@ import io
 import os
 import sys
 import time
-import math
 import argparse
 import logging
+import subprocess
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
 
+# ── FFmpeg path configuration ─────────────────────────────────────
 def configure_ffmpeg():
     downloads_dir = Path.home() / "Downloads"
     default_ffmpeg_dir = downloads_dir / "ffmpeg-master-latest-win64-gpl" / "bin"
@@ -41,31 +44,34 @@ def configure_ffmpeg():
         return str(default_ffmpeg_dir / "ffmpeg.exe"), str(default_ffmpeg_dir / "ffprobe.exe")
     return None, None
 
+
 ffmpeg_path, ffprobe_path = configure_ffmpeg()
 
-try:
-    import speech_recognition as sr
-except ImportError:
-    sr = None
-
+# ── Optional pydub (used only for audio extraction from video) ─────
 try:
     from pydub import AudioSegment
-    if ffmpeg_path and ffprobe_path:
+    if ffmpeg_path:
         AudioSegment.converter = ffmpeg_path
+    if ffprobe_path:
         AudioSegment.ffprobe = ffprobe_path
 except ImportError:
     AudioSegment = None
 
+# ── Watchdog ───────────────────────────────────────────────────────
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+# ── MarkItDown ─────────────────────────────────────────────────────
 from markitdown import MarkItDown
 
-# -- Logging setup --------------------------------------------------
-console_stream = None
+# ── Logging setup ──────────────────────────────────────────────────
 try:
-    console_stream = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    console_stream = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+    )
 except Exception:
     console_stream = sys.stdout
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -77,26 +83,183 @@ logging.basicConfig(
 )
 log = logging.getLogger("MarkItDownAuto")
 
-# -- Supported file extensions -------------------------------------
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4"}
+# ── Supported extensions ────────────────────────────────────────────
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4", ".mkv", ".avi", ".mov", ".webm"}
+
 SUPPORTED_EXTS = {
     # Documents
     ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
     # Web / text
     ".html", ".htm", ".txt", ".csv", ".json", ".xml",
-    # Audio / video
-    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4",
-    # Special: a .txt file named youtube_links.txt is handled separately
+    # Audio / Video – transcribed via Whisper
+    ".mp3", ".wav", ".m4a", ".flac", ".ogg",
+    ".mp4", ".mkv", ".avi", ".mov", ".webm",
 }
 
 YOUTUBE_FILENAME = "youtube_links.txt"
 
+# ── Whisper model (loaded once, lazily) ────────────────────────────
+_whisper_model = None
+WHISPER_MODEL_SIZE = "base"   # tiny | base | small | medium | large
 
-def convert_file(filepath: Path, output_dir: Path) -> bool:
-    """Convert a single file to Markdown. Returns True on success."""
+
+def get_whisper_model():
+    """Load and cache the Whisper model (downloaded once, cached on disk)."""
+    global _whisper_model
+    if _whisper_model is None:
+        try:
+            import whisper
+            log.info(f"Loading Whisper '{WHISPER_MODEL_SIZE}' model (first-time download may take a moment)…")
+            _whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
+            log.info("Whisper model ready.")
+        except Exception as e:
+            log.error(f"Could not load Whisper: {e}")
+            raise
+    return _whisper_model
+
+
+# ── Audio/Video → full transcript via Whisper ──────────────────────
+def extract_audio_to_wav(video_path: Path) -> Path:
+    """
+    Extract audio from any video/audio file and save as a 16-kHz mono WAV
+    in a temp file.  Returns the temp WAV path.
+    Uses ffmpeg if available, falls back to pydub.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+
+    ext = video_path.suffix.lower()
+    wav_formats = {".wav"}
+
+    # Try ffmpeg first (best compatibility)
+    if ffmpeg_path and Path(ffmpeg_path).exists():
+        cmd = [
+            ffmpeg_path,
+            "-y",                   # overwrite output
+            "-i", str(video_path),  # input
+            "-ar", "16000",         # 16 kHz sample rate (Whisper prefers this)
+            "-ac", "1",             # mono
+            "-c:a", "pcm_s16le",    # 16-bit PCM
+            str(tmp_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return tmp_path
+        else:
+            log.warning(f"ffmpeg extraction failed: {result.stderr[-300:]}")
+
+    # Fallback: pydub
+    if AudioSegment is not None:
+        fmt = ext.lstrip(".")
+        audio = AudioSegment.from_file(str(video_path), format=fmt)
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        audio.export(str(tmp_path), format="wav")
+        return tmp_path
+
+    raise RuntimeError(
+        "No audio extraction tool available. "
+        "Install ffmpeg or pydub+ffmpeg to process audio/video files."
+    )
+
+
+def transcribe_with_whisper(file_path: Path) -> str:
+    """
+    Transcribe an audio/video file FULLY using OpenAI Whisper.
+    Returns the complete transcript as a single string.
+    """
+    model = get_whisper_model()
+
+    # For video files we need to extract audio first; Whisper accepts wav natively
+    need_extraction = file_path.suffix.lower() not in {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+    tmp_wav = None
+
+    try:
+        if need_extraction or file_path.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".webm"}:
+            log.info(f"Extracting audio from {file_path.name}…")
+            tmp_wav = extract_audio_to_wav(file_path)
+            audio_input = str(tmp_wav)
+        else:
+            audio_input = str(file_path)
+
+        log.info(f"Transcribing with Whisper ({WHISPER_MODEL_SIZE})… (this may take a moment for long files)")
+        result = model.transcribe(
+            audio_input,
+            language=None,          # auto-detect language
+            verbose=False,          # suppress per-segment stdout noise
+            fp16=False,             # safe for CPU-only machines
+            word_timestamps=False,
+        )
+
+        # Compose full transcript with timestamps per segment for readability
+        segments = result.get("segments", [])
+        if segments:
+            lines = []
+            for seg in segments:
+                start = seg["start"]
+                end   = seg["end"]
+                text  = seg["text"].strip()
+                if text:
+                    mm_s = int(start // 60)
+                    ss_s = int(start % 60)
+                    mm_e = int(end   // 60)
+                    ss_e = int(end   % 60)
+                    lines.append(f"[{mm_s:02d}:{ss_s:02d} → {mm_e:02d}:{ss_e:02d}]  {text}")
+            transcript = "\n".join(lines)
+        else:
+            transcript = result.get("text", "").strip()
+
+        detected_lang = result.get("language", "unknown")
+        log.info(f"Transcription complete – {len(transcript)} chars, language: {detected_lang}")
+        return transcript
+
+    finally:
+        if tmp_wav and tmp_wav.exists():
+            try:
+                tmp_wav.unlink()
+            except Exception:
+                pass
+
+
+# ── Audio/Video conversion ─────────────────────────────────────────
+def convert_audio_file(filepath: Path, output_dir: Path) -> bool:
+    """Convert an audio/video file to Markdown using Whisper transcription."""
     out_path = output_dir / (filepath.stem + ".md")
     if out_path.exists():
-        log.info(f"Skipping: {filepath.name} (already converted, output file exists)")
+        log.info(f"Skipping: {filepath.name} (already converted)")
+        return True
+
+    log.info(f"Converting: {filepath.name}")
+    try:
+        transcript = transcribe_with_whisper(filepath)
+
+        if not transcript or not transcript.strip():
+            log.warning(f"Empty transcript for {filepath.name} – no speech detected or silent file.")
+            return False
+
+        header = (
+            f"# {filepath.stem}\n\n"
+            f"> Source: `{filepath.name}`  \n"
+            f"> Converted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n"
+            f"> Transcription: OpenAI Whisper ({WHISPER_MODEL_SIZE})\n\n"
+            f"---\n\n"
+        )
+
+        out_path.write_text(header + "## Transcript\n\n" + transcript + "\n", encoding="utf-8")
+        log.info(f"✅ Saved: {out_path.name}  ({len(transcript):,} chars)")
+        return True
+
+    except Exception as e:
+        log.error(f"❌ Failed to convert {filepath.name}: {e}")
+        return False
+
+
+# ── Document conversion (PDF, DOCX, PPTX, XLSX, HTML, TXT…) ───────
+def convert_file(filepath: Path, output_dir: Path) -> bool:
+    """Convert a document to Markdown via MarkItDown. Returns True on success."""
+    out_path = output_dir / (filepath.stem + ".md")
+    if out_path.exists():
+        log.info(f"Skipping: {filepath.name} (already converted)")
         return True
 
     md = MarkItDown()
@@ -105,10 +268,9 @@ def convert_file(filepath: Path, output_dir: Path) -> bool:
         result = md.convert(str(filepath))
 
         if not result.text_content or result.text_content.strip() == "":
-            log.warning(f"Empty output for {filepath.name} - skipping.")
+            log.warning(f"Empty output for {filepath.name} – skipping.")
             return False
 
-        # Add a nice header
         header = (
             f"# {filepath.stem}\n\n"
             f"> Source: `{filepath.name}`  \n"
@@ -117,127 +279,15 @@ def convert_file(filepath: Path, output_dir: Path) -> bool:
         )
 
         out_path.write_text(header + result.text_content, encoding="utf-8")
-        log.info(f"Saved: {out_path.name} ({len(result.text_content)} chars)")
+        log.info(f"✅ Saved: {out_path.name}  ({len(result.text_content):,} chars)")
         return True
 
     except Exception as e:
-        log.error(f"Failed to convert {filepath.name}: {e}")
+        log.error(f"❌ Failed to convert {filepath.name}: {e}")
         return False
 
 
-def transcribe_long_audio(file_path: Path) -> str:
-    """Transcribe long audio using speech_recognition in chunks.
-
-    Uses 10-second chunks with 1.5s overlap to stay within Google's free
-    Speech API limits and avoid cutting words at chunk boundaries.
-    Retries each chunk up to 3 times on transient failures.
-    """
-    if sr is None or AudioSegment is None:
-        raise RuntimeError("speech_recognition and pydub are required for long audio transcription")
-
-    audio_ext = file_path.suffix.lower().lstrip('.')
-    audio = AudioSegment.from_file(str(file_path), format=audio_ext)
-    duration_ms = len(audio)
-
-    # Smaller chunks work far more reliably with Google's free Speech API.
-    # 30-second chunks often get silently truncated; 10 seconds is the sweet spot.
-    chunk_ms = 10_000
-    overlap_ms = 1_500          # slight overlap so words aren't cut mid-syllable
-    step_ms = chunk_ms - overlap_ms  # advance by 8.5 s per iteration
-    max_retries = 3
-    retry_delay = 2             # seconds between retries
-
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300   # sensible default for varied audio
-    transcripts = []
-
-    total_chunks = math.ceil(max(duration_ms - overlap_ms, 1) / step_ms)
-
-    chunk_index = 0
-    pos = 0
-    while pos < duration_ms:
-        chunk_index += 1
-        end = min(pos + chunk_ms, duration_ms)
-        segment = audio[pos:end]
-
-        # Export chunk to in-memory WAV
-        buffer = io.BytesIO()
-        segment.export(buffer, format='wav')
-        buffer.seek(0)
-
-        text = ''
-        last_error = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                with sr.AudioFile(buffer) as source:
-                    audio_data = recognizer.record(source)
-                    text = recognizer.recognize_google(audio_data).strip()
-                break  # success
-            except sr.UnknownValueError:
-                # Google couldn't understand the audio – likely silence / noise
-                log.debug(f"Chunk {chunk_index}/{total_chunks}: speech not recognised (attempt {attempt})")
-                text = ''
-                break  # no point retrying if the audio itself is unintelligible
-            except sr.RequestError as e:
-                last_error = e
-                log.warning(f"Chunk {chunk_index}/{total_chunks}: request error (attempt {attempt}/{max_retries}): {e}")
-                if attempt < max_retries:
-                    buffer.seek(0)  # reset buffer for retry
-                    time.sleep(retry_delay)
-            except Exception as e:
-                last_error = e
-                log.warning(f"Chunk {chunk_index}/{total_chunks}: unexpected error (attempt {attempt}/{max_retries}): {e}")
-                if attempt < max_retries:
-                    buffer.seek(0)
-                    time.sleep(retry_delay)
-
-        if text:
-            transcripts.append(text)
-            log.info(f"Transcribed chunk {chunk_index}/{total_chunks} ({len(text)} chars)")
-        else:
-            reason = f" – {last_error}" if last_error else " – no speech detected"
-            log.warning(f"Chunk {chunk_index}/{total_chunks}: empty result{reason}")
-
-        pos += step_ms  # advance by step (chunk minus overlap)
-
-    if not transcripts:
-        log.warning("No transcript produced for any chunk")
-        return ''
-
-    return ' '.join(transcripts)
-
-
-def convert_audio_file(filepath: Path, output_dir: Path):
-    """Convert an audio/video file to Markdown by chunked transcription."""
-    out_path = output_dir / (filepath.stem + ".md")
-    if out_path.exists():
-        log.info(f"Skipping: {filepath.name} (already converted, output file exists)")
-        return True
-
-    try:
-        log.info(f"Converting: {filepath.name}")
-        transcript = transcribe_long_audio(filepath)
-
-        if not transcript or transcript.strip() == "":
-            log.warning(f"Empty transcript for {filepath.name}")
-            return False
-
-        header = (
-            f"# {filepath.stem}\n\n"
-            f"> Source: `{filepath.name}`  \n"
-            f"> Converted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"---\n\n"
-        )
-
-        out_path.write_text(header + "### Audio Transcript:\n" + transcript, encoding="utf-8")
-        log.info(f"Saved: {out_path.name}")
-        return True
-
-    except Exception as e:
-        log.error(f"Failed to convert {filepath.name}: {e}")
-        return False
-
-
+# ── YouTube link conversion ────────────────────────────────────────
 def convert_youtube_links(filepath: Path, output_dir: Path):
     """Read a file of YouTube URLs (one per line) and convert each to Markdown."""
     md = MarkItDown()
@@ -248,16 +298,15 @@ def convert_youtube_links(filepath: Path, output_dir: Path):
         log.warning("youtube_links.txt found but no valid URLs inside.")
         return
 
-    log.info(f"Found {len(urls)} YouTube URL(s) to transcribe...")
+    log.info(f"Found {len(urls)} YouTube URL(s) to transcribe…")
 
     for url in urls:
         try:
-            # Use video ID or sanitized URL as filename
             video_id = url.split("v=")[-1].split("&")[0] if "v=" in url else url[-11:]
             out_path = output_dir / f"youtube_{video_id}.md"
 
             if out_path.exists():
-                log.info(f"Skipping YouTube URL: {url} (already converted, output file exists)")
+                log.info(f"Skipping YouTube URL: {url} (already converted)")
                 continue
 
             log.info(f"Transcribing: {url}")
@@ -275,25 +324,39 @@ def convert_youtube_links(filepath: Path, output_dir: Path):
             )
 
             out_path.write_text(header + result.text_content, encoding="utf-8")
-            log.info(f"Saved: {out_path.name}")
+            log.info(f"✅ Saved: {out_path.name}")
 
         except Exception as e:
-            log.error(f"Failed for {url}: {e}")
-
-def process_existing_files(input_dir: Path, output_dir: Path):
-    """On startup, convert any files already in the input folder."""
-    files = list(input_dir.iterdir())
-    if not files:
-        return
-    log.info(f"Processing {len(files)} existing file(s) in input folder...")
-    for f in files:
-        if f.is_file():
-            handle_new_file(f, output_dir)
+            log.error(f"❌ Failed for {url}: {e}")
 
 
+# ── Ignored file patterns ─────────────────────────────────────────
+IGNORED_EXTS    = {".log", ".tmp", ".bak", ".part", ".crdownload", ".md"}
+IGNORED_PREFIXES = (".", "~")   # hidden files and Office temp files
+
+
+def is_ignorable(filepath: Path) -> bool:
+    """Return True for files that should never be processed."""
+    name = filepath.name
+    if name.startswith(IGNORED_PREFIXES):
+        return True
+    if filepath.suffix.lower() in IGNORED_EXTS:
+        return True
+    return False
+
+
+# ── Dispatch: decide how to handle a file ─────────────────────────
 def handle_new_file(filepath: Path, output_dir: Path):
     """Decide how to handle a newly detected file."""
-    # Special case: YouTube links file
+    if not filepath.exists():
+        log.warning(f"File disappeared before processing: {filepath.name}")
+        return
+
+    if is_ignorable(filepath):
+        log.debug(f"Ignored file: {filepath.name}")
+        return
+
+    # Special case: YouTube links
     if filepath.name.lower() == YOUTUBE_FILENAME:
         convert_youtube_links(filepath, output_dir)
         return
@@ -304,41 +367,84 @@ def handle_new_file(filepath: Path, output_dir: Path):
     elif ext in SUPPORTED_EXTS:
         convert_file(filepath, output_dir)
     else:
-        log.debug(f"Skipped (unsupported): {filepath.name}")
+        log.warning(f"Skipped (unsupported extension): {filepath.name}")
 
 
-# ── Watchdog event handler ──────────────────────────────────────
+# ── Process files already present on startup ───────────────────────
+def process_existing_files(input_dir: Path, output_dir: Path):
+    """On startup, convert any files already in the input folder."""
+    files = [f for f in input_dir.iterdir() if f.is_file()]
+    if not files:
+        log.info("Input folder is empty – waiting for files…")
+        return
+    log.info(f"Processing {len(files)} existing file(s) in input folder…")
+    for f in sorted(files):
+        handle_new_file(f, output_dir)
+
+
+# ── Watchdog event handler ─────────────────────────────────────────
 class FolderWatcher(FileSystemEventHandler):
+    """Watches the input folder and auto-converts new files."""
+
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
-        self._recently_seen: set = set()
+        self._processing: set = set()   # debounce: filenames currently being processed
 
     def on_created(self, event):
         if event.is_directory:
             return
-        filepath = Path(event.src_path)
+        self._process_event(event.src_path)
 
-        # Debounce: skip if we just saw this file (within 2 seconds)
-        key = str(filepath)
-        if key in self._recently_seen:
+    def on_moved(self, event):
+        """Handle files moved/renamed into the watched folder."""
+        if event.is_directory:
             return
-        self._recently_seen.add(key)
+        self._process_event(event.dest_path)
 
-        # Small delay to ensure file is fully written before reading
-        time.sleep(1.5)
+    def _process_event(self, src_path: str):
+        filepath = Path(src_path)
 
-        if filepath.exists():
-            handle_new_file(filepath, self.output_dir)
+        # Skip if already being processed (debounce)
+        key = str(filepath)
+        if key in self._processing:
+            return
+        self._processing.add(key)
 
-        # Clean up debounce set after 5 seconds
-        time.sleep(5)
-        self._recently_seen.discard(key)
+        try:
+            # Wait for the file to finish being written (important for large videos)
+            self._wait_for_file_stable(filepath)
+
+            if filepath.exists():
+                log.info(f"🆕 New file detected: {filepath.name}")
+                handle_new_file(filepath, self.output_dir)
+        finally:
+            # Allow re-processing after 10s (in case the file is replaced)
+            time.sleep(10)
+            self._processing.discard(key)
+
+    def _wait_for_file_stable(self, filepath: Path, timeout: int = 60):
+        """Wait until the file size stops changing (fully written)."""
+        prev_size = -1
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                curr_size = filepath.stat().st_size
+            except FileNotFoundError:
+                return
+            if curr_size == prev_size and curr_size > 0:
+                return          # stable
+            prev_size = curr_size
+            time.sleep(1.5)
+        log.warning(f"Timeout waiting for {filepath.name} to finish writing.")
 
 
-# ── Main ────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────
 def main():
+    global WHISPER_MODEL_SIZE  # must appear before any use of the name
+
+    _default_model = WHISPER_MODEL_SIZE   # capture before possibly overwriting
     parser = argparse.ArgumentParser(
-        description="Auto-convert files to Markdown using MarkItDown"
+        description="Auto-convert files to Markdown using OpenAI Whisper + MarkItDown"
     )
     parser.add_argument(
         "--input", default="./inputs",
@@ -352,21 +458,36 @@ def main():
         "--once", action="store_true",
         help="Process existing files and exit (no watching)"
     )
+    parser.add_argument(
+        "--model", default=_default_model,
+        choices=["tiny", "base", "small", "medium", "large"],
+        help=f"Whisper model size (default: {_default_model}). "
+             "Larger = more accurate but slower."
+    )
     args = parser.parse_args()
 
-    input_dir = Path(args.input).resolve()
+    WHISPER_MODEL_SIZE = args.model
+    input_dir  = Path(args.input).resolve()
     output_dir = Path(args.output).resolve()
 
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("=" * 55)
-    log.info("  MarkItDown Auto-Converter")
-    log.info("=" * 55)
-    log.info(f"  Watching : {input_dir}")
-    log.info(f"  Outputs  : {output_dir}")
-    log.info(f"  Supported: PDF, DOCX, PPTX, XLSX, MP3, WAV, HTML, TXT + YouTube URLs")
-    log.info("=" * 55)
+    log.info("=" * 60)
+    log.info("  MarkItDown Auto-Converter  (Whisper Edition)")
+    log.info("=" * 60)
+    log.info(f"  Input  : {input_dir}")
+    log.info(f"  Output : {output_dir}")
+    log.info(f"  Whisper: {WHISPER_MODEL_SIZE} model")
+    log.info(f"  Docs   : PDF, DOCX, PPTX, XLSX, HTML, TXT, CSV, JSON")
+    log.info(f"  Media  : MP3, WAV, M4A, FLAC, OGG, MP4, MKV, AVI, MOV, WEBM")
+    log.info("=" * 60)
+
+    # Pre-load the Whisper model so the first conversion isn't slow
+    try:
+        get_whisper_model()
+    except Exception:
+        log.warning("Whisper model could not be loaded – audio/video conversion will fail.")
 
     # Process files already in the folder
     process_existing_files(input_dir, output_dir)
@@ -375,23 +496,29 @@ def main():
         log.info("--once flag set. Exiting after processing existing files.")
         return
 
-    # Start watching
-    handler = FolderWatcher(output_dir)
+    # ── Start watching ──────────────────────────────────────────────
+    handler  = FolderWatcher(output_dir)
     observer = Observer()
     observer.schedule(handler, str(input_dir), recursive=False)
     observer.start()
 
-    log.info("Watching for new files... (Press Ctrl+C to stop)")
+    log.info("👀 Watching for new files… (Press Ctrl+C to stop)")
 
     try:
         while True:
-            time.sleep(1)
+            # Heartbeat check: restart observer if it dies unexpectedly
+            if not observer.is_alive():
+                log.warning("Observer died – restarting…")
+                observer = Observer()
+                observer.schedule(handler, str(input_dir), recursive=False)
+                observer.start()
+            time.sleep(2)
     except KeyboardInterrupt:
-        log.info("Stopping watcher...")
+        log.info("Stopping watcher…")
+    finally:
         observer.stop()
-
-    observer.join()
-    log.info("Done.")
+        observer.join()
+        log.info("Done.")
 
 
 if __name__ == "__main__":
